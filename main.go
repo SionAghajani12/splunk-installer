@@ -561,10 +561,13 @@ func startSplunk(installDir string, acceptLicense bool) error {
 
 	log.Info("Starting Splunk: %s %s", splunkBin, strings.Join(args, " "))
 
-	cmd := exec.Command("sudo", append([]string{"-u", SplunkUser, splunkBin}, args...)...)
+	// Use su -s /bin/sh instead of sudo -u because the splunk user has
+	// nologin shell and sudo is explicitly denied. Since the installer
+	// already runs as root, su works without a password.
+	shellCmd := fmt.Sprintf("SPLUNK_HOME=%s %s %s", installDir, splunkBin, strings.Join(args, " "))
+	cmd := exec.Command("su", "-s", "/bin/sh", SplunkUser, "-c", shellCmd)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), fmt.Sprintf("SPLUNK_HOME=%s", installDir))
 
 	return cmd.Run()
 }
@@ -671,9 +674,13 @@ func applySecurityHardening(installDir string) error {
 func uninstallSplunk(installDir string) error {
 	splunkBin := filepath.Join(installDir, "bin", "splunk")
 
-	// Stop Splunk if running
+	// Stop Splunk — try systemd first, fall back to su
 	log.Info("Stopping Splunk...")
-	exec.Command(splunkBin, "stop").Run()
+	if err := exec.Command("systemctl", "stop", "Splunkd.service").Run(); err != nil {
+		// systemd didn't work, try direct stop via su
+		shellCmd := fmt.Sprintf("%s stop", splunkBin)
+		exec.Command("su", "-s", "/bin/sh", SplunkUser, "-c", shellCmd).Run()
+	}
 
 	// Disable boot-start
 	exec.Command(splunkBin, "disable", "boot-start").Run()
@@ -689,8 +696,9 @@ func uninstallSplunk(installDir string) error {
 		return fmt.Errorf("removal failed: %w", err)
 	}
 
-	// Remove limits file
+	// Remove config files created by the installer
 	os.Remove("/etc/security/limits.d/99-splunk.conf")
+	os.Remove("/etc/sudoers.d/99-splunk-deny")
 
 	log.Info("✓ Splunk uninstalled from %s", installDir)
 	return nil
@@ -966,10 +974,14 @@ Examples:
 ║  Management:     https://localhost:%d                           ║
 ║  Admin User:     %-47s ║
 ║                                                                  ║
-║  Useful commands:                                                ║
-║    sudo -u %s %s/bin/splunk status              ║
-║    sudo -u %s %s/bin/splunk restart             ║
-║    sudo -u %s %s/bin/splunk search '...'        ║
+║  Useful commands (run as root):                                  ║
+║    su -s /bin/sh %s -c '%s/bin/splunk status'    ║
+║    su -s /bin/sh %s -c '%s/bin/splunk restart'   ║
+║    su -s /bin/sh %s -c '%s/bin/splunk stop'      ║
+║                                                                  ║
+║  Or use systemd:                                                 ║
+║    systemctl status Splunkd                                      ║
+║    systemctl restart Splunkd                                     ║
 ║                                                                  ║
 ╚══════════════════════════════════════════════════════════════════╝
 `,
