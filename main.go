@@ -426,18 +426,38 @@ func createSplunkUser() error {
 	if err := exec.Command("getent", "passwd", SplunkUser).Run(); err != nil {
 		log.Info("Creating user: %s", SplunkUser)
 		if err := exec.Command("useradd",
-			"-r",                    // system account
-			"-g", SplunkGroup,       // primary group
-			"-d", DefaultInstallDir, // home dir
-			"-s", "/bin/bash",       // shell
-			"--no-create-home",
+			"-r",                       // system account
+			"-g", SplunkGroup,          // primary group
+			"-d", DefaultInstallDir,    // home dir
+			"-s", "/usr/sbin/nologin",  // no interactive login
+			"-M",                       // no home directory
 			SplunkUser,
 		).Run(); err != nil {
 			return fmt.Errorf("failed to create user %s: %w", SplunkUser, err)
 		}
+
+		// Lock the password so no one can su into this account
+		exec.Command("passwd", "-l", SplunkUser).Run()
+		log.Info("✓ Splunk user created with nologin shell and locked password")
 	}
 
-	log.Info("✓ Splunk user/group ready")
+	// Ensure splunk user is NOT in sudo/wheel groups
+	for _, sudoGroup := range []string{"sudo", "wheel", "admin"} {
+		exec.Command("gpasswd", "-d", SplunkUser, sudoGroup).Run()
+	}
+
+	// Drop an explicit sudoers deny file so no one grants it later by accident
+	sudoersDeny := fmt.Sprintf("# Splunk service account — no sudo access ever\n%s ALL=(ALL) !ALL\n", SplunkUser)
+	sudoersFile := fmt.Sprintf("/etc/sudoers.d/99-splunk-deny")
+	if _, err := os.Stat(sudoersFile); os.IsNotExist(err) {
+		if err := os.WriteFile(sudoersFile, []byte(sudoersDeny), 0440); err != nil {
+			log.Warn("Could not write sudoers deny file: %v", err)
+		} else {
+			log.Info("✓ Sudo access explicitly denied for %s", SplunkUser)
+		}
+	}
+
+	log.Info("✓ Splunk user/group ready (no login, no sudo)")
 	return nil
 }
 
