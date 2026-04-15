@@ -1,0 +1,5 @@
+splunk-installer
+.claude/
+*.tgz
+*.rpm
+*.deb

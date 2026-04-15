@@ -19,21 +19,89 @@ import (
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
-// BuildVersion is set at compile time via -ldflags
-var BuildVersion = "dev"
-
 const (
-	DefaultSplunkVersion = "9.4.1"
+	DefaultSplunkVersion = "10.0.0"
 	DefaultInstallDir    = "/opt/splunk"
 	SplunkUser           = "splunk"
 	SplunkGroup          = "splunk"
 	MinDiskSpaceMB       = 5120  // 5 GB
 	MinRAMMB             = 4096  // 4 GB
-	MinRAMMB_ARM64       = 2048  // 2 GB — ARM servers often have less
 	SplunkWebPort        = 8000
 	SplunkMgmtPort       = 8089
 	SplunkIdxPort        = 9997
 )
+
+// KnownRelease is a pinned Splunk download (URL contains a build hash,
+// so we can't construct it from version alone — we hardcode known-good builds).
+type KnownRelease struct {
+	Version string
+	Format  string // "tgz" or "rpm"
+	Arch    string // "amd64"
+	URL     string
+	Filename string
+}
+
+// KnownReleases — add new versions here as they are published.
+// Default is the first entry.
+var KnownReleases = []KnownRelease{
+	{
+		Version:  "10.0.0",
+		Format:   "tgz",
+		Arch:     "amd64",
+		Filename: "splunk-10.0.0-e8eb0c4654f8-linux-amd64.tgz",
+		URL:      "https://download.splunk.com/products/splunk/releases/10.0.0/linux/splunk-10.0.0-e8eb0c4654f8-linux-amd64.tgz",
+	},
+	{
+		Version:  "9.4.10",
+		Format:   "tgz",
+		Arch:     "amd64",
+		Filename: "splunk-9.4.10-3673ab0c12ee-linux-amd64.tgz",
+		URL:      "https://download.splunk.com/products/splunk/releases/9.4.10/linux/splunk-9.4.10-3673ab0c12ee-linux-amd64.tgz",
+	},
+	{
+		Version:  "9.4.9",
+		Format:   "rpm",
+		Arch:     "amd64",
+		Filename: "splunk-9.4.9-03bb451d4e07.x86_64.rpm",
+		URL:      "https://download.splunk.com/products/splunk/releases/9.4.9/linux/splunk-9.4.9-03bb451d4e07.x86_64.rpm",
+	},
+	{
+		Version:  "9.4.8",
+		Format:   "tgz",
+		Arch:     "amd64",
+		Filename: "splunk-9.4.8-c543277b24fa-linux-amd64.tgz",
+		URL:      "https://download.splunk.com/products/splunk/releases/9.4.8/linux/splunk-9.4.8-c543277b24fa-linux-amd64.tgz",
+	},
+	{
+		Version:  "9.4.3",
+		Format:   "tgz",
+		Arch:     "amd64",
+		Filename: "splunk-9.4.3-237ebbd22314-linux-amd64.tgz",
+		URL:      "https://download.splunk.com/products/splunk/releases/9.4.3/linux/splunk-9.4.3-237ebbd22314-linux-amd64.tgz",
+	},
+}
+
+func findRelease(version string) (*KnownRelease, bool) {
+	for i := range KnownReleases {
+		if KnownReleases[i].Version == version {
+			return &KnownReleases[i], true
+		}
+	}
+	return nil, false
+}
+
+func listReleases() {
+	fmt.Println("Available pinned Splunk versions:")
+	for i, r := range KnownReleases {
+		marker := "  "
+		if i == 0 {
+			marker = "* " // default
+		}
+		fmt.Printf("  %s%-8s  %s  %s\n", marker, r.Version, r.Format, r.Filename)
+	}
+	fmt.Println("\n  * = default")
+	fmt.Println("  Use --version <ver>, --download-url <url>, or --package-path <file>.")
+}
 
 // SplunkEdition represents different Splunk packages
 type SplunkEdition string
@@ -125,50 +193,6 @@ func checkArch() (string, error) {
 	}
 }
 
-// getARM64PlatformInfo detects ARM-specific details relevant to Splunk.
-// Splunk on ARM requires specific kernel page sizes and has some feature
-// differences compared to x86_64.
-func getARM64PlatformInfo() {
-	if runtime.GOARCH != "arm64" {
-		return
-	}
-
-	log.Info("ARM64 platform detected — running additional checks...")
-
-	// Kernel page size (Splunk works best with 4K pages; some ARM distros use 64K)
-	out, err := exec.Command("getconf", "PAGESIZE").Output()
-	if err == nil {
-		pageSize := strings.TrimSpace(string(out))
-		log.Info("  Kernel page size: %s bytes", pageSize)
-		if pageSize != "4096" {
-			log.Warn("  Non-4K page size detected (%s). Some Splunk features may behave differently.", pageSize)
-			log.Warn("  If you encounter issues, consider a kernel with 4K pages (CONFIG_ARM64_4K_PAGES).")
-		}
-	}
-
-	// Detect if running on common ARM platforms (AWS Graviton, Ampere, Apple Silicon VM, etc.)
-	cpuInfo, err := os.ReadFile("/proc/cpuinfo")
-	if err == nil {
-		content := strings.ToLower(string(cpuInfo))
-		switch {
-		case strings.Contains(content, "neoverse"):
-			log.Info("  Platform: AWS Graviton / Ampere Altra (Neoverse cores)")
-		case strings.Contains(content, "cortex-a"):
-			log.Info("  Platform: ARM Cortex-A series")
-		case strings.Contains(content, "apple"):
-			log.Info("  Platform: Apple Silicon (VM)")
-		default:
-			log.Info("  Platform: Generic ARM64")
-		}
-	}
-
-	// Check if running under QEMU emulation (common mistake — very slow)
-	if _, err := os.Stat("/proc/sys/fs/binfmt_misc/qemu-aarch64"); err == nil {
-		log.Warn("  QEMU user-mode emulation detected! This will be extremely slow.")
-		log.Warn("  For production, run on native ARM64 hardware.")
-	}
-}
-
 func getDistroInfo() (name string, packageMgr string) {
 	data, err := os.ReadFile("/etc/os-release")
 	if err != nil {
@@ -249,9 +273,6 @@ func runPreflightChecks(cfg *Config) error {
 	}
 	log.Info("✓ Architecture: %s", arch)
 
-	// 3b. ARM64-specific platform checks
-	getARM64PlatformInfo()
-
 	// 4. Disk space
 	diskMB, err := getDiskSpaceMB(cfg.InstallDir)
 	if err != nil {
@@ -262,16 +283,12 @@ func runPreflightChecks(cfg *Config) error {
 		log.Info("✓ Disk space: %d MB available", diskMB)
 	}
 
-	// 5. RAM (lower threshold for ARM64 since those servers often have less)
-	minRAM := uint64(MinRAMMB)
-	if runtime.GOARCH == "arm64" {
-		minRAM = MinRAMMB_ARM64
-	}
+	// 5. RAM
 	ramMB, err := getTotalRAMMB()
 	if err != nil {
 		log.Warn("Could not check RAM: %v", err)
-	} else if ramMB < minRAM {
-		log.Warn("Low RAM: %d MB (recommended: %d MB). Splunk may underperform.", ramMB, minRAM)
+	} else if ramMB < MinRAMMB {
+		log.Warn("Low RAM: %d MB (recommended: %d MB). Splunk may underperform.", ramMB, MinRAMMB)
 	} else {
 		log.Info("✓ RAM: %d MB available", ramMB)
 	}
@@ -298,51 +315,18 @@ func runPreflightChecks(cfg *Config) error {
 
 // ─── Download / Package Handling ────────────────────────────────────────────
 
-func buildDownloadURL(cfg *Config) string {
+// buildDownloadURL resolves the URL to download. Priority:
+//   1. explicit --download-url
+//   2. pinned KnownReleases match for cfg.Version
+// Returns ("", false) if neither applies; caller should error and suggest --list-versions.
+func buildDownloadURL(cfg *Config) (string, bool) {
 	if cfg.DownloadURL != "" {
-		return cfg.DownloadURL
+		return cfg.DownloadURL, true
 	}
-
-	arch, _ := checkArch()
-	_, pkgMgr := getDistroInfo()
-
-	var product string
-	if cfg.Edition == UniversalForwarder {
-		product = "universalforwarder"
-	} else {
-		product = "splunk"
+	if r, ok := findRelease(cfg.Version); ok {
+		return r.URL, true
 	}
-
-	// Splunk uses different naming conventions per arch + package format:
-	//   tgz:  splunk-9.4.1-Linux-x86_64.tgz       / splunk-9.4.1-Linux-aarch64.tgz
-	//   deb:  splunk-9.4.1-linux-amd64.deb          / splunk-9.4.1-linux-arm64.deb  (NOTE: "arm64" not "aarch64")
-	//   rpm:  splunk-9.4.1-linux-x86_64.rpm         / splunk-9.4.1-linux-aarch64.rpm
-	var ext string
-	switch pkgMgr {
-	case "deb":
-		// Debian packages use "arm64" naming, not "aarch64"
-		debArch := arch
-		if debArch == "aarch64" {
-			debArch = "arm64"
-		} else if debArch == "x86_64" {
-			debArch = "amd64"
-		}
-		ext = fmt.Sprintf("linux-%s.deb", debArch)
-	case "rpm":
-		ext = fmt.Sprintf("linux-%s.rpm", arch)
-	default:
-		ext = fmt.Sprintf("Linux-%s.tgz", arch)
-	}
-
-	url := fmt.Sprintf("https://download.splunk.com/products/%s/releases/%s/linux/%s-%s-%s",
-		product, cfg.Version, product, cfg.Version, ext)
-
-	if runtime.GOARCH == "arm64" {
-		log.Info("ARM64 download URL constructed — note that not all Splunk versions have ARM64 packages.")
-		log.Info("If download fails, verify ARM64 availability for version %s at https://www.splunk.com/en_us/download.html", cfg.Version)
-	}
-
-	return url
+	return "", false
 }
 
 func downloadFile(url, destPath string) error {
@@ -426,38 +410,18 @@ func createSplunkUser() error {
 	if err := exec.Command("getent", "passwd", SplunkUser).Run(); err != nil {
 		log.Info("Creating user: %s", SplunkUser)
 		if err := exec.Command("useradd",
-			"-r",                       // system account
-			"-g", SplunkGroup,          // primary group
-			"-d", DefaultInstallDir,    // home dir
-			"-s", "/usr/sbin/nologin",  // no interactive login
-			"-M",                       // no home directory
+			"-r",                    // system account
+			"-g", SplunkGroup,       // primary group
+			"-d", DefaultInstallDir, // home dir
+			"-s", "/bin/bash",       // shell
+			"--no-create-home",
 			SplunkUser,
 		).Run(); err != nil {
 			return fmt.Errorf("failed to create user %s: %w", SplunkUser, err)
 		}
-
-		// Lock the password so no one can su into this account
-		exec.Command("passwd", "-l", SplunkUser).Run()
-		log.Info("✓ Splunk user created with nologin shell and locked password")
 	}
 
-	// Ensure splunk user is NOT in sudo/wheel groups
-	for _, sudoGroup := range []string{"sudo", "wheel", "admin"} {
-		exec.Command("gpasswd", "-d", SplunkUser, sudoGroup).Run()
-	}
-
-	// Drop an explicit sudoers deny file so no one grants it later by accident
-	sudoersDeny := fmt.Sprintf("# Splunk service account — no sudo access ever\n%s ALL=(ALL) !ALL\n", SplunkUser)
-	sudoersFile := fmt.Sprintf("/etc/sudoers.d/99-splunk-deny")
-	if _, err := os.Stat(sudoersFile); os.IsNotExist(err) {
-		if err := os.WriteFile(sudoersFile, []byte(sudoersDeny), 0440); err != nil {
-			log.Warn("Could not write sudoers deny file: %v", err)
-		} else {
-			log.Info("✓ Sudo access explicitly denied for %s", SplunkUser)
-		}
-	}
-
-	log.Info("✓ Splunk user/group ready (no login, no sudo)")
+	log.Info("✓ Splunk user/group ready")
 	return nil
 }
 
@@ -561,13 +525,10 @@ func startSplunk(installDir string, acceptLicense bool) error {
 
 	log.Info("Starting Splunk: %s %s", splunkBin, strings.Join(args, " "))
 
-	// Use su -s /bin/sh instead of sudo -u because the splunk user has
-	// nologin shell and sudo is explicitly denied. Since the installer
-	// already runs as root, su works without a password.
-	shellCmd := fmt.Sprintf("SPLUNK_HOME=%s %s %s", installDir, splunkBin, strings.Join(args, " "))
-	cmd := exec.Command("su", "-s", "/bin/sh", SplunkUser, "-c", shellCmd)
+	cmd := exec.Command("sudo", append([]string{"-u", SplunkUser, splunkBin}, args...)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(), fmt.Sprintf("SPLUNK_HOME=%s", installDir))
 
 	return cmd.Run()
 }
@@ -674,13 +635,9 @@ func applySecurityHardening(installDir string) error {
 func uninstallSplunk(installDir string) error {
 	splunkBin := filepath.Join(installDir, "bin", "splunk")
 
-	// Stop Splunk — try systemd first, fall back to su
+	// Stop Splunk if running
 	log.Info("Stopping Splunk...")
-	if err := exec.Command("systemctl", "stop", "Splunkd.service").Run(); err != nil {
-		// systemd didn't work, try direct stop via su
-		shellCmd := fmt.Sprintf("%s stop", splunkBin)
-		exec.Command("su", "-s", "/bin/sh", SplunkUser, "-c", shellCmd).Run()
-	}
+	exec.Command(splunkBin, "stop").Run()
 
 	// Disable boot-start
 	exec.Command(splunkBin, "disable", "boot-start").Run()
@@ -696,9 +653,8 @@ func uninstallSplunk(installDir string) error {
 		return fmt.Errorf("removal failed: %w", err)
 	}
 
-	// Remove config files created by the installer
+	// Remove limits file
 	os.Remove("/etc/security/limits.d/99-splunk.conf")
-	os.Remove("/etc/sudoers.d/99-splunk-deny")
 
 	log.Info("✓ Splunk uninstalled from %s", installDir)
 	return nil
@@ -729,7 +685,7 @@ func promptPassword() string {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 func printBanner() {
-	fmt.Printf(`
+	fmt.Println(`
 ╔══════════════════════════════════════════════════════════════════╗
 ║                                                                  ║
 ║   ███████╗██████╗ ██╗     ██╗   ██╗███╗   ██╗██╗  ██╗           ║
@@ -739,11 +695,9 @@ func printBanner() {
 ║   ███████║██║     ███████╗╚██████╔╝██║ ╚████║██║  ╚██╗          ║
 ║   ╚══════╝╚═╝     ╚══════╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝   ╚═╝        ║
 ║                                                                  ║
-║   Automated Installer v%-40s ║
-║   Platform: %-51s ║
+║              Automated Installer (Go Edition)                    ║
 ║                                                                  ║
-╚══════════════════════════════════════════════════════════════════╝
-`, BuildVersion, fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH))
+╚══════════════════════════════════════════════════════════════════╝`)
 }
 
 func printSummary(cfg *Config) {
@@ -784,6 +738,7 @@ func main() {
 	flag.BoolVar(&cfg.DryRun, "dry-run", false, "Show what would be done without making changes")
 	flag.BoolVar(&cfg.Verbose, "verbose", false, "Enable verbose/debug logging")
 	flag.BoolVar(&cfg.Uninstall, "uninstall", false, "Uninstall Splunk from install-dir")
+	listVersions := flag.Bool("list-versions", false, "List pinned Splunk versions and exit")
 
 	flag.Usage = func() {
 		printBanner()
@@ -809,6 +764,11 @@ Examples:
 	}
 
 	flag.Parse()
+
+	if *listVersions {
+		listReleases()
+		return
+	}
 
 	log.Verbose = cfg.Verbose
 
@@ -876,7 +836,12 @@ Examples:
 	log.Step(3, totalSteps, "Obtaining Splunk package")
 	packagePath := cfg.PackagePath
 	if packagePath == "" {
-		url := buildDownloadURL(cfg)
+		url, ok := buildDownloadURL(cfg)
+		if !ok {
+			log.Error("No pinned release for version %q and no --download-url given.", cfg.Version)
+			log.Info("Run with --list-versions to see pinned builds, or pass --download-url / --package-path.")
+			os.Exit(1)
+		}
 		packagePath = filepath.Join("/tmp", filepath.Base(url))
 
 		if cfg.DryRun {
@@ -974,14 +939,10 @@ Examples:
 ║  Management:     https://localhost:%d                           ║
 ║  Admin User:     %-47s ║
 ║                                                                  ║
-║  Useful commands (run as root):                                  ║
-║    su -s /bin/sh %s -c '%s/bin/splunk status'    ║
-║    su -s /bin/sh %s -c '%s/bin/splunk restart'   ║
-║    su -s /bin/sh %s -c '%s/bin/splunk stop'      ║
-║                                                                  ║
-║  Or use systemd:                                                 ║
-║    systemctl status Splunkd                                      ║
-║    systemctl restart Splunkd                                     ║
+║  Useful commands:                                                ║
+║    sudo -u %s %s/bin/splunk status              ║
+║    sudo -u %s %s/bin/splunk restart             ║
+║    sudo -u %s %s/bin/splunk search '...'        ║
 ║                                                                  ║
 ╚══════════════════════════════════════════════════════════════════╝
 `,
