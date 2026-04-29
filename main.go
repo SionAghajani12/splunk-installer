@@ -24,20 +24,23 @@ const (
 	DefaultInstallDir    = "/opt/splunk"
 	SplunkUser           = "splunk"
 	SplunkGroup          = "splunk"
-	MinDiskSpaceMB       = 5120  // 5 GB
-	MinRAMMB             = 4096  // 4 GB
+	MinDiskSpaceMB       = 5120 // 5 GB
+	MinRAMMB             = 4096 // 4 GB
 	SplunkWebPort        = 8000
 	SplunkMgmtPort       = 8089
 	SplunkIdxPort        = 9997
+
+	RunAsSplunk = "splunk" // dedicated splunk user (default, hardened)
+	RunAsRoot   = "root"   // run as root, no splunk user
 )
 
 // KnownRelease is a pinned Splunk download (URL contains a build hash,
 // so we can't construct it from version alone — we hardcode known-good builds).
 type KnownRelease struct {
-	Version string
-	Format  string // "tgz" or "rpm"
-	Arch    string // "amd64"
-	URL     string
+	Version  string
+	Format   string // "tgz" or "rpm"
+	Arch     string // "amd64"
+	URL      string
 	Filename string
 }
 
@@ -113,19 +116,22 @@ const (
 
 // Config holds all installation parameters
 type Config struct {
-	Version       string
-	Edition       SplunkEdition
-	InstallDir    string
-	AdminUser     string
-	AdminPassword string
-	AcceptLicense bool
-	EnableBoot    bool
+	Version           string
+	Edition           SplunkEdition
+	InstallDir        string
+	AdminUser         string
+	AdminPassword     string
+	AcceptLicense     bool
+	EnableBoot        bool
 	ConfigureFirewall bool
-	PackagePath   string // local .tgz or .deb/.rpm path
-	DownloadURL   string // explicit URL override
-	DryRun        bool
-	Verbose       bool
-	Uninstall     bool
+	PackagePath       string // local .tgz or .deb/.rpm path
+	DownloadURL       string // explicit URL override
+	DryRun            bool
+	Verbose           bool
+	Uninstall         bool
+	// RunAs controls whether Splunk runs as a dedicated locked-down splunk user
+	// ("splunk", default) or directly as root ("root").
+	RunAs string
 }
 
 // Logger provides leveled logging
@@ -217,7 +223,6 @@ func getDistroInfo() (name string, packageMgr string) {
 }
 
 func getDiskSpaceMB(path string) (uint64, error) {
-	// Use df as a portable approach
 	dir := filepath.Dir(path)
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		dir = "/"
@@ -254,26 +259,22 @@ func getTotalRAMMB() (uint64, error) {
 func runPreflightChecks(cfg *Config) error {
 	log.Info("Running preflight checks...")
 
-	// 1. Root check
 	if err := checkRoot(); err != nil {
 		return err
 	}
 	log.Info("✓ Running as root")
 
-	// 2. OS check
 	if err := checkOS(); err != nil {
 		return err
 	}
 	log.Info("✓ Operating system supported")
 
-	// 3. Architecture
 	arch, err := checkArch()
 	if err != nil {
 		return err
 	}
 	log.Info("✓ Architecture: %s", arch)
 
-	// 4. Disk space
 	diskMB, err := getDiskSpaceMB(cfg.InstallDir)
 	if err != nil {
 		log.Warn("Could not check disk space: %v", err)
@@ -283,7 +284,6 @@ func runPreflightChecks(cfg *Config) error {
 		log.Info("✓ Disk space: %d MB available", diskMB)
 	}
 
-	// 5. RAM
 	ramMB, err := getTotalRAMMB()
 	if err != nil {
 		log.Warn("Could not check RAM: %v", err)
@@ -293,7 +293,6 @@ func runPreflightChecks(cfg *Config) error {
 		log.Info("✓ RAM: %d MB available", ramMB)
 	}
 
-	// 6. Check for existing installation
 	if _, err := os.Stat(filepath.Join(cfg.InstallDir, "bin", "splunk")); err == nil {
 		log.Warn("Existing Splunk installation detected at %s", cfg.InstallDir)
 		if !cfg.Uninstall {
@@ -301,8 +300,11 @@ func runPreflightChecks(cfg *Config) error {
 		}
 	}
 
-	// 7. Required tools
-	for _, tool := range []string{"tar", "useradd", "groupadd"} {
+	required := []string{"tar"}
+	if cfg.RunAs == RunAsSplunk {
+		required = append(required, "useradd", "groupadd")
+	}
+	for _, tool := range required {
 		if _, err := exec.LookPath(tool); err != nil {
 			return fmt.Errorf("required tool not found: %s", tool)
 		}
@@ -315,10 +317,6 @@ func runPreflightChecks(cfg *Config) error {
 
 // ─── Download / Package Handling ────────────────────────────────────────────
 
-// buildDownloadURL resolves the URL to download. Priority:
-//   1. explicit --download-url
-//   2. pinned KnownReleases match for cfg.Version
-// Returns ("", false) if neither applies; caller should error and suggest --list-versions.
 func buildDownloadURL(cfg *Config) (string, bool) {
 	if cfg.DownloadURL != "" {
 		return cfg.DownloadURL, true
@@ -353,7 +351,6 @@ func downloadFile(url, destPath string) error {
 	}
 	defer out.Close()
 
-	// Progress tracking
 	contentLength := resp.ContentLength
 	reader := &progressReader{
 		reader: resp.Body,
@@ -369,7 +366,7 @@ func downloadFile(url, destPath string) error {
 		return fmt.Errorf("download incomplete: %w", err)
 	}
 
-	fmt.Println() // newline after progress
+	fmt.Println()
 	log.Info("Downloaded %d bytes", written)
 	log.Info("SHA-256: %s", hex.EncodeToString(hasher.Sum(nil)))
 	return nil
@@ -398,7 +395,6 @@ func (pr *progressReader) Read(p []byte) (int, error) {
 // ─── Installation ───────────────────────────────────────────────────────────
 
 func createSplunkUser() error {
-	// Check if group exists
 	if err := exec.Command("getent", "group", SplunkGroup).Run(); err != nil {
 		log.Info("Creating group: %s", SplunkGroup)
 		if err := exec.Command("groupadd", "-r", SplunkGroup).Run(); err != nil {
@@ -406,14 +402,13 @@ func createSplunkUser() error {
 		}
 	}
 
-	// Check if user exists
 	if err := exec.Command("getent", "passwd", SplunkUser).Run(); err != nil {
 		log.Info("Creating user: %s", SplunkUser)
 		if err := exec.Command("useradd",
-			"-r",                    // system account
-			"-g", SplunkGroup,       // primary group
-			"-d", DefaultInstallDir, // home dir
-			"-s", "/bin/bash",       // shell
+			"-r",
+			"-g", SplunkGroup,
+			"-d", DefaultInstallDir,
+			"-s", "/bin/bash",
 			"--no-create-home",
 			SplunkUser,
 		).Run(); err != nil {
@@ -421,7 +416,17 @@ func createSplunkUser() error {
 		}
 	}
 
-	log.Info("✓ Splunk user/group ready")
+	// Lock password and remove from privilege groups so the account can only
+	// be entered via `sudo -u splunk` — not via su or login.
+	exec.Command("passwd", "-l", SplunkUser).Run()
+	for _, grp := range []string{"sudo", "wheel", "admin"} {
+		exec.Command("gpasswd", "-d", SplunkUser, grp).Run()
+	}
+	sudoersFile := "/etc/sudoers.d/99-splunk-deny"
+	content := fmt.Sprintf("# Deny splunk user sudo access\n%s ALL=(ALL) !ALL\n", SplunkUser)
+	os.WriteFile(sudoersFile, []byte(content), 0440)
+
+	log.Info("✓ Splunk user/group ready (locked, no sudo)")
 	return nil
 }
 
@@ -449,7 +454,6 @@ func installFromDeb(packagePath string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		// Try fixing dependencies
 		log.Warn("dpkg reported issues, attempting to fix dependencies...")
 		fix := exec.Command("apt-get", "install", "-f", "-y")
 		fix.Stdout = os.Stdout
@@ -496,6 +500,14 @@ func setOwnership(installDir string) error {
 	return cmd.Run()
 }
 
+// repairOwnership re-applies splunk:splunk ownership after a start/restart.
+// When the splunk binary is invoked via sudo (even as -u splunk), some internal
+// Splunk processes may write files as root inside etc/ or var/. This corrects that.
+func repairOwnership(installDir string) error {
+	log.Info("Repairing file ownership after start...")
+	return exec.Command("chown", "-R", fmt.Sprintf("%s:%s", SplunkUser, SplunkGroup), installDir).Run()
+}
+
 // ─── Post-Install Configuration ─────────────────────────────────────────────
 
 func createAdminCredentials(installDir, adminUser, adminPassword string) error {
@@ -508,13 +520,18 @@ func createAdminCredentials(installDir, adminUser, adminPassword string) error {
 	if err := os.WriteFile(seedFile, []byte(content), 0600); err != nil {
 		return err
 	}
-	// Set ownership
 	exec.Command("chown", fmt.Sprintf("%s:%s", SplunkUser, SplunkGroup), seedFile).Run()
 	log.Info("✓ Admin credentials configured")
 	return nil
 }
 
-func startSplunk(installDir string, acceptLicense bool) error {
+// startSplunk starts the Splunk daemon.
+//
+// runAs == RunAsSplunk: invoked as `sudo -E -u splunk <splunkBin> start ...`
+//   -E preserves the caller's environment so SPLUNK_HOME is inherited.
+//
+// runAs == RunAsRoot: invoked directly with SPLUNK_HOME set in the process env.
+func startSplunk(installDir string, acceptLicense bool, runAs string) error {
 	splunkBin := filepath.Join(installDir, "bin", "splunk")
 
 	args := []string{"start", "--no-prompt"}
@@ -523,27 +540,38 @@ func startSplunk(installDir string, acceptLicense bool) error {
 	}
 	args = append(args, "--answer-yes")
 
-	log.Info("Starting Splunk: %s %s", splunkBin, strings.Join(args, " "))
+	env := append(os.Environ(), fmt.Sprintf("SPLUNK_HOME=%s", installDir))
 
-	cmd := exec.Command("sudo", append([]string{"-u", SplunkUser, splunkBin}, args...)...)
+	var cmd *exec.Cmd
+	if runAs == RunAsSplunk {
+		// -E: preserve environment (passes SPLUNK_HOME through sudo)
+		cmd = exec.Command("sudo", append([]string{"-E", "-u", SplunkUser, splunkBin}, args...)...)
+	} else {
+		cmd = exec.Command(splunkBin, args...)
+	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), fmt.Sprintf("SPLUNK_HOME=%s", installDir))
+	cmd.Env = env
 
+	log.Info("Starting Splunk as %s ...", runAs)
 	return cmd.Run()
 }
 
-func enableBootStart(installDir string) error {
+// enableBootStart registers Splunk with systemd.
+// In splunk-user mode it adds -user splunk so systemd starts the process as
+// the splunk user. In root mode no -user flag is passed.
+func enableBootStart(installDir string, runAs string) error {
 	splunkBin := filepath.Join(installDir, "bin", "splunk")
 	log.Info("Enabling boot-start with systemd...")
 
-	cmd := exec.Command(splunkBin, "enable", "boot-start",
-		"-user", SplunkUser,
-		"-systemd-managed", "1",
-		"--accept-license",
-		"--answer-yes",
-		"--no-prompt",
-	)
+	args := []string{"enable", "boot-start"}
+	if runAs == RunAsSplunk {
+		args = append(args, "-user", SplunkUser)
+	}
+	args = append(args, "-systemd-managed", "1", "--accept-license", "--answer-yes", "--no-prompt")
+
+	cmd := exec.Command(splunkBin, args...)
+	cmd.Env = append(os.Environ(), fmt.Sprintf("SPLUNK_HOME=%s", installDir))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -557,7 +585,6 @@ func enableBootStart(installDir string) error {
 func configureFirewall() error {
 	ports := []int{SplunkWebPort, SplunkMgmtPort, SplunkIdxPort}
 
-	// Try firewalld first
 	if _, err := exec.LookPath("firewall-cmd"); err == nil {
 		log.Info("Configuring firewalld...")
 		for _, port := range ports {
@@ -568,7 +595,6 @@ func configureFirewall() error {
 		return nil
 	}
 
-	// Try ufw
 	if _, err := exec.LookPath("ufw"); err == nil {
 		log.Info("Configuring ufw...")
 		for _, port := range ports {
@@ -578,7 +604,6 @@ func configureFirewall() error {
 		return nil
 	}
 
-	// Fall back to iptables
 	if _, err := exec.LookPath("iptables"); err == nil {
 		log.Info("Configuring iptables...")
 		for _, port := range ports {
@@ -593,14 +618,18 @@ func configureFirewall() error {
 	return nil
 }
 
-func applySecurityHardening(installDir string) error {
+// applySecurityHardening applies OS-level hardening.
+// In root mode the chmod 700 steps are skipped — Splunk runs as root and owns
+// all files, so restricting directory bits would only break root's own access
+// after future writes.
+func applySecurityHardening(installDir string, runAs string) error {
 	log.Info("Applying basic security hardening...")
 
-	// Restrict file permissions
-	exec.Command("chmod", "700", filepath.Join(installDir, "etc")).Run()
-	exec.Command("chmod", "700", filepath.Join(installDir, "var")).Run()
+	if runAs == RunAsSplunk {
+		exec.Command("chmod", "700", filepath.Join(installDir, "etc")).Run()
+		exec.Command("chmod", "700", filepath.Join(installDir, "var")).Run()
+	}
 
-	// Disable transparent huge pages (performance recommendation)
 	thpPaths := []string{
 		"/sys/kernel/mm/transparent_hugepage/enabled",
 		"/sys/kernel/mm/transparent_hugepage/defrag",
@@ -611,13 +640,16 @@ func applySecurityHardening(installDir string) error {
 		}
 	}
 
-	// Set ulimits via limits.d
+	user := "root"
+	if runAs == RunAsSplunk {
+		user = SplunkUser
+	}
 	limitsContent := fmt.Sprintf(`# Splunk recommended ulimits
 %s soft nofile 65535
 %s hard nofile 65535
 %s soft nproc  20480
 %s hard nproc  20480
-`, SplunkUser, SplunkUser, SplunkUser, SplunkUser)
+`, user, user, user, user)
 
 	limitsFile := "/etc/security/limits.d/99-splunk.conf"
 	if err := os.WriteFile(limitsFile, []byte(limitsContent), 0644); err != nil {
@@ -635,26 +667,22 @@ func applySecurityHardening(installDir string) error {
 func uninstallSplunk(installDir string) error {
 	splunkBin := filepath.Join(installDir, "bin", "splunk")
 
-	// Stop Splunk if running
 	log.Info("Stopping Splunk...")
 	exec.Command(splunkBin, "stop").Run()
 
-	// Disable boot-start
 	exec.Command(splunkBin, "disable", "boot-start").Run()
 
-	// Remove systemd unit
 	exec.Command("systemctl", "disable", "Splunkd.service").Run()
 	os.Remove("/etc/systemd/system/Splunkd.service")
 	exec.Command("systemctl", "daemon-reload").Run()
 
-	// Remove install directory
 	log.Info("Removing %s ...", installDir)
 	if err := os.RemoveAll(installDir); err != nil {
 		return fmt.Errorf("removal failed: %w", err)
 	}
 
-	// Remove limits file
 	os.Remove("/etc/security/limits.d/99-splunk.conf")
+	os.Remove("/etc/sudoers.d/99-splunk-deny")
 
 	log.Info("✓ Splunk uninstalled from %s", installDir)
 	return nil
@@ -695,7 +723,7 @@ func printBanner() {
 ║   ███████║██║     ███████╗╚██████╔╝██║ ╚████║██║  ╚██╗          ║
 ║   ╚══════╝╚═╝     ╚══════╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝   ╚═╝        ║
 ║                                                                  ║
-║              Automated Installer (Go Edition)                    ║
+║              Automated Installer v3 (Go Edition)                 ║
 ║                                                                  ║
 ╚══════════════════════════════════════════════════════════════════╝`)
 }
@@ -707,6 +735,7 @@ func printSummary(cfg *Config) {
 │  Version:       %-50s│
 │  Install Dir:   %-50s│
 │  Admin User:    %-50s│
+│  Run As:        %-50s│
 │  Boot Start:    %-50s│
 │  Firewall:      %-50s│
 │  Dry Run:       %-50s│
@@ -716,6 +745,7 @@ func printSummary(cfg *Config) {
 		cfg.Version,
 		cfg.InstallDir,
 		cfg.AdminUser,
+		cfg.RunAs,
 		fmt.Sprintf("%v", cfg.EnableBoot),
 		fmt.Sprintf("%v", cfg.ConfigureFirewall),
 		fmt.Sprintf("%v", cfg.DryRun),
@@ -738,6 +768,10 @@ func main() {
 	flag.BoolVar(&cfg.DryRun, "dry-run", false, "Show what would be done without making changes")
 	flag.BoolVar(&cfg.Verbose, "verbose", false, "Enable verbose/debug logging")
 	flag.BoolVar(&cfg.Uninstall, "uninstall", false, "Uninstall Splunk from install-dir")
+	flag.StringVar(&cfg.RunAs, "run-as", RunAsSplunk,
+		`Process identity for Splunk:
+    splunk  — create a locked-down splunk system user; Splunk runs as that user (default, recommended)
+    root    — skip user creation; Splunk runs as root (simpler, less secure)`)
 	listVersions := flag.Bool("list-versions", false, "List pinned Splunk versions and exit")
 
 	flag.Usage = func() {
@@ -746,8 +780,11 @@ func main() {
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, `
 Examples:
-  # Install from a pre-downloaded tarball
-  sudo ./splunk-installer --package-path /tmp/splunk-9.4.1-Linux-x86_64.tgz --accept-license --admin-password 'MyP@ss123'
+  # Install as dedicated splunk user (default, hardened)
+  sudo ./splunk-installer --package-path /tmp/splunk-10.0.0-e8eb0c4654f8-linux-amd64.tgz --accept-license --admin-password 'MyP@ss123'
+
+  # Install running as root (simpler, automation-friendly)
+  sudo ./splunk-installer --run-as root --package-path /tmp/splunk-10.0.0-e8eb0c4654f8-linux-amd64.tgz --accept-license --admin-password 'MyP@ss123'
 
   # Install with a custom download URL
   sudo ./splunk-installer --download-url 'https://...' --accept-license --admin-password 'MyP@ss123'
@@ -755,8 +792,8 @@ Examples:
   # Install Universal Forwarder
   sudo ./splunk-installer --edition forwarder --package-path /tmp/splunkforwarder.tgz --accept-license
 
-  # Dry run to see what would happen
-  sudo ./splunk-installer --dry-run --version 9.4.1
+  # Dry run to preview steps
+  sudo ./splunk-installer --dry-run --version 9.4.10 --accept-license --admin-password test12345
 
   # Uninstall
   sudo ./splunk-installer --uninstall
@@ -775,6 +812,11 @@ Examples:
 	cfg.Edition = SplunkEdition(*edition)
 	if cfg.Edition != Enterprise && cfg.Edition != UniversalForwarder {
 		log.Error("Invalid edition: %s (use 'enterprise' or 'forwarder')", *edition)
+		os.Exit(1)
+	}
+
+	if cfg.RunAs != RunAsSplunk && cfg.RunAs != RunAsRoot {
+		log.Error("Invalid --run-as value: %q (use 'splunk' or 'root')", cfg.RunAs)
 		os.Exit(1)
 	}
 
@@ -807,7 +849,6 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Prompt for password if not provided
 	if cfg.AdminPassword == "" && cfg.Edition == Enterprise {
 		cfg.AdminPassword = promptPassword()
 	}
@@ -821,15 +862,19 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Step 2: Create splunk user
-	log.Step(2, totalSteps, "Creating Splunk user/group")
-	if cfg.DryRun {
-		log.Info("[DRY RUN] Would create user=%s group=%s", SplunkUser, SplunkGroup)
-	} else {
-		if err := createSplunkUser(); err != nil {
-			log.Error("%v", err)
-			os.Exit(1)
+	// Step 2: Create splunk user (splunk mode only)
+	log.Step(2, totalSteps, "User/group setup")
+	if cfg.RunAs == RunAsSplunk {
+		if cfg.DryRun {
+			log.Info("[DRY RUN] Would create user=%s group=%s (locked, no sudo)", SplunkUser, SplunkGroup)
+		} else {
+			if err := createSplunkUser(); err != nil {
+				log.Error("%v", err)
+				os.Exit(1)
+			}
 		}
+	} else {
+		log.Info("--run-as root: skipping splunk user creation, Splunk will run as root")
 	}
 
 	// Step 3: Obtain package
@@ -872,22 +917,26 @@ Examples:
 		}
 	}
 
-	// Step 5: Set ownership
-	log.Step(5, totalSteps, "Setting file ownership")
-	if cfg.DryRun {
-		log.Info("[DRY RUN] Would chown %s to %s:%s", cfg.InstallDir, SplunkUser, SplunkGroup)
-	} else {
-		if err := setOwnership(cfg.InstallDir); err != nil {
-			log.Error("Failed to set ownership: %v", err)
-			os.Exit(1)
+	// Step 5: Set ownership (splunk mode only)
+	log.Step(5, totalSteps, "File ownership")
+	if cfg.RunAs == RunAsSplunk {
+		if cfg.DryRun {
+			log.Info("[DRY RUN] Would chown %s to %s:%s", cfg.InstallDir, SplunkUser, SplunkGroup)
+		} else {
+			if err := setOwnership(cfg.InstallDir); err != nil {
+				log.Error("Failed to set ownership: %v", err)
+				os.Exit(1)
+			}
+			log.Info("✓ Ownership set to splunk:splunk")
 		}
-		log.Info("✓ Ownership set")
+	} else {
+		log.Info("--run-as root: skipping chown, files remain root-owned")
 	}
 
 	// Step 6: Configure + start
 	log.Step(6, totalSteps, "Configuring and starting Splunk")
 	if cfg.DryRun {
-		log.Info("[DRY RUN] Would configure admin credentials and start Splunk")
+		log.Info("[DRY RUN] Would configure admin credentials and start Splunk as %s", cfg.RunAs)
 	} else {
 		if cfg.Edition == Enterprise && cfg.AdminPassword != "" {
 			if err := createAdminCredentials(cfg.InstallDir, cfg.AdminUser, cfg.AdminPassword); err != nil {
@@ -895,11 +944,19 @@ Examples:
 				os.Exit(1)
 			}
 		}
-		if err := startSplunk(cfg.InstallDir, cfg.AcceptLicense); err != nil {
+		if err := startSplunk(cfg.InstallDir, cfg.AcceptLicense, cfg.RunAs); err != nil {
 			log.Error("Failed to start Splunk: %v", err)
 			os.Exit(1)
 		}
 		log.Info("✓ Splunk started successfully")
+
+		// After start, some Splunk internal processes may have written files as
+		// root even in splunk-user mode. Re-apply ownership to fix that.
+		if cfg.RunAs == RunAsSplunk {
+			if err := repairOwnership(cfg.InstallDir); err != nil {
+				log.Warn("Ownership repair failed (non-fatal): %v", err)
+			}
+		}
 	}
 
 	// Step 7: Boot start + firewall
@@ -908,7 +965,7 @@ Examples:
 		log.Info("[DRY RUN] Would enable boot-start=%v, configure-firewall=%v", cfg.EnableBoot, cfg.ConfigureFirewall)
 	} else {
 		if cfg.EnableBoot {
-			if err := enableBootStart(cfg.InstallDir); err != nil {
+			if err := enableBootStart(cfg.InstallDir, cfg.RunAs); err != nil {
 				log.Warn("Boot-start configuration failed: %v", err)
 			}
 		}
@@ -924,33 +981,42 @@ Examples:
 	if cfg.DryRun {
 		log.Info("[DRY RUN] Would apply security hardening (ulimits, THP, permissions)")
 	} else {
-		if err := applySecurityHardening(cfg.InstallDir); err != nil {
+		if err := applySecurityHardening(cfg.InstallDir, cfg.RunAs); err != nil {
 			log.Warn("Some hardening steps failed: %v", err)
 		}
 	}
 
-	// Done!
+	// Done — print mode-appropriate management commands
+	var statusCmd, restartCmd string
+	if cfg.RunAs == RunAsSplunk {
+		statusCmd = fmt.Sprintf("sudo -u %s %s/bin/splunk status", SplunkUser, cfg.InstallDir)
+		restartCmd = fmt.Sprintf("sudo -u %s %s/bin/splunk restart", SplunkUser, cfg.InstallDir)
+	} else {
+		statusCmd = fmt.Sprintf("SPLUNK_HOME=%s %s/bin/splunk status", cfg.InstallDir, cfg.InstallDir)
+		restartCmd = fmt.Sprintf("SPLUNK_HOME=%s %s/bin/splunk restart", cfg.InstallDir, cfg.InstallDir)
+	}
+
 	fmt.Printf(`
 ╔══════════════════════════════════════════════════════════════════╗
 ║                    Installation Complete!                         ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║                                                                  ║
-║  Splunk Web:     http://localhost:%d                            ║
-║  Management:     https://localhost:%d                           ║
-║  Admin User:     %-47s ║
+║  Splunk Web:  http://localhost:%d                               ║
+║  Management:  https://localhost:%d                              ║
+║  Admin User:  %-51s║
+║  Run As:      %-51s║
 ║                                                                  ║
 ║  Useful commands:                                                ║
-║    sudo -u %s %s/bin/splunk status              ║
-║    sudo -u %s %s/bin/splunk restart             ║
-║    sudo -u %s %s/bin/splunk search '...'        ║
+║    %-61s║
+║    %-61s║
 ║                                                                  ║
 ╚══════════════════════════════════════════════════════════════════╝
 `,
 		SplunkWebPort,
 		SplunkMgmtPort,
 		cfg.AdminUser,
-		SplunkUser, cfg.InstallDir,
-		SplunkUser, cfg.InstallDir,
-		SplunkUser, cfg.InstallDir,
+		cfg.RunAs,
+		statusCmd,
+		restartCmd,
 	)
 }
